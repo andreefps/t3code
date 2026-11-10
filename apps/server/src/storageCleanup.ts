@@ -1,4 +1,5 @@
 import {
+  CommandId,
   GitCommandError,
   OrchestrationV2AppThreadJson,
   OrchestrationV2ProviderSessionJson,
@@ -16,6 +17,7 @@ import type {
   StorageCleanupReportEntry,
   ThreadId,
 } from "@t3tools/contracts";
+import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import { resolveWorktreeCleanup } from "@t3tools/shared/projectSettings";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import * as Context from "effect/Context";
@@ -587,14 +589,13 @@ const make = Effect.gen(function* () {
     }
   });
 
-  // Use two small Git reads: statusDetailsLocal also diffs and counts for every worktree.
-  const branchChanged = Effect.fn("StorageCleanup.branchChanged")(function* (
-    cwd: string,
-    branch: string | null,
-  ) {
+  // Removal keeps branches, so only a detached HEAD can strand commits. Returns a keep reason
+  // or the checked-out branch (null when detached at a commit a branch, tag or remote contains).
+  // Small Git reads only: statusDetailsLocal also diffs and counts for every worktree.
+  const checkoutState = Effect.fn("StorageCleanup.checkoutState")(function* (cwd: string) {
     const failure = (detail: string) =>
       new GitCommandError({
-        operation: "StorageCleanup.branchChanged",
+        operation: "StorageCleanup.checkoutState",
         command: "git",
         cwd,
         detail,
@@ -603,7 +604,7 @@ const make = Effect.gen(function* () {
     const read = Effect.fnUntraced(function* (args: string[], allowedExitCode?: number) {
       const result = yield* git
         .execute({
-          operation: "StorageCleanup.branchChanged",
+          operation: "StorageCleanup.checkoutState",
           cwd,
           args,
           env: { LC_ALL: "C" },
@@ -623,18 +624,36 @@ const make = Effect.gen(function* () {
         result.stderr.trim().split(/\r?\n/)[0]?.slice(0, 1000) || "command failed",
       );
     });
+    const notRepository = "not a git repository";
     const index = yield* read(["rev-parse", "--git-path", "index"]);
-    if (index === null) return true;
+    if (index === null) return notRepository;
     if (yield* fs.exists(`${path.resolve(cwd, index.stdout.trim())}.lock`))
       return yield* failure(
         "Git index is locked. Status will resume when the index lock is removed.",
       );
     // Detached HEAD exits 1; full refs avoid shortening when a tag shares the branch name.
     const head = yield* read(["symbolic-ref", "--quiet", "HEAD"], 1);
-    if (head === null) return true;
+    if (head === null) return notRepository;
     const ref = head.exitCode === 0 ? head.stdout.trim() : "";
-    const name = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length).trim() : null;
-    return (name?.startsWith("(") ? null : name) !== branch;
+    const branch = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : null;
+    const commit = yield* read(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], 1);
+    if (commit === null) return notRepository;
+    if (commit.exitCode !== 0) return "branch has no commits";
+    if (branch !== null) return { branch };
+    // Not --all: it includes every worktree's HEAD, this one too.
+    const stranded = yield* read([
+      "rev-list",
+      "--max-count=1",
+      "HEAD",
+      "--not",
+      "--branches",
+      "--tags",
+      "--remotes",
+    ]);
+    if (stranded === null) return notRepository;
+    return stranded.stdout.trim() === ""
+      ? { branch: null }
+      : "detached HEAD has commits no branch, tag or remote contains";
   });
 
   const localChangesReason = Effect.fn("StorageCleanup.localChangesReason")(function* (
@@ -985,8 +1004,24 @@ const make = Effect.gen(function* () {
         if (pathReason !== null) return keep(pathReason);
         if (yield* containsProjectRoot(worktreePath, [project, ...snapshot.projects]))
           return keep("contains a project checkout");
-        if (yield* branchChanged(worktreePath, thread.branch))
-          return keep("repository or branch changed");
+        const checkout = yield* checkoutState(worktreePath);
+        if (typeof checkout === "string") return keep(checkout);
+        if (!deleted && checkout.branch !== null && checkout.branch !== thread.branch) {
+          // Resume recreates the recorded branch and merge rules look up its pull request.
+          for (const member of group)
+            yield* engine
+              .dispatch({
+                type: "thread.metadata.update",
+                commandId: CommandId.make(yield* randomUuidV4),
+                threadId: member.id,
+                branch: checkout.branch,
+                expectedBranch: member.branch,
+                expectedWorktreePath: member.worktreePath,
+              })
+              // A concurrent branch sync or edit wins; the next cleanup reads the result.
+              .pipe(Effect.catchTags({ OrchestratorDispatchError: () => Effect.void }));
+          return keep(`branch changed to ${checkout.branch}; the next cleanup rechecks it`);
+        }
         const changes = yield* localChangesReason(worktreePath, settings);
         if (changes !== null) return keep(changes);
         const head = yield* git.resolveCommit({ cwd: worktreePath, revision: "HEAD" });
@@ -1185,7 +1220,8 @@ const make = Effect.gen(function* () {
             if (pathReason !== null) return keep(pathReason);
             const blockedWhileMeasuring = yield* blockedSinceCheck();
             if (blockedWhileMeasuring !== null) return keep(blockedWhileMeasuring);
-            if (yield* branchChanged(worktreePath, thread.branch))
+            const latestCheckout = yield* checkoutState(worktreePath);
+            if (typeof latestCheckout === "string" || latestCheckout.branch !== checkout.branch)
               return keep("repository or branch changed since check");
             if (
               (yield* git.resolveCommit({ cwd: worktreePath, revision: "HEAD" })).commitSha !==

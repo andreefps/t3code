@@ -46,6 +46,7 @@ import {
   RuntimeRequestId,
   ThreadId,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2ServerCommand,
   type OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -428,6 +429,16 @@ const cleanupFixture = (
       } as unknown as ProviderSessionManager.ProviderSessionManagerV2["Service"]),
       Effect.provideService(Orchestrator.OrchestratorV2, {
         streamDomainEvents: Stream.suspend(() => events),
+        dispatch: (command: OrchestrationV2ServerCommand) =>
+          Effect.sync(() => {
+            if (command.type === "thread.metadata.update")
+              threads = threads.map((thread) =>
+                thread.id === command.threadId && thread.branch === command.expectedBranch
+                  ? { ...thread, branch: command.branch ?? null }
+                  : thread,
+              );
+            return {};
+          }),
       } as unknown as Orchestrator.OrchestratorV2["Service"]),
       Effect.provideService(SqlClient.SqlClient, ((strings: TemplateStringsArray) =>
         Effect.sync(() =>
@@ -520,6 +531,7 @@ const cleanupFixture = (
       setThreads: (next: typeof threads) => {
         threads = next;
       },
+      threads: () => threads,
       setOnLiveCheck: (hook: Effect.Effect<void>) => {
         onLiveCheck = hook;
       },
@@ -2410,20 +2422,20 @@ describe("storage cleanup reports and local file policies", () => {
       }),
     ),
   );
-  it.live("compares the checked-out branch without a full status", () =>
+  it.live("removes a worktree on any branch unless its detached HEAD strands commits", () =>
     runCleanupTest(
       Effect.gen(function* () {
-        const { service, fs, repo, worktree, command, setThreads, fullStatusCalls } =
+        const { service, fs, repo, worktree, command, threads, fullStatusCalls } =
           yield* cleanupFixture();
-        const changed = { outcome: "kept", reason: "Repository or branch changed" };
+        const keptFor = (reason: string) => ({ outcome: "kept", reason });
         yield* command(worktree, ["checkout", "--detach"]);
-        expect((yield* service.runNow).entries[0]).toMatchObject(changed);
+        yield* fs.writeFileString(`${worktree}/tracked.txt`, "detached work\n");
+        yield* command(worktree, ["commit", "-am", "detached work"]);
+        expect((yield* service.runNow).entries[0]).toMatchObject(
+          keptFor("Detached HEAD has commits no branch, tag or remote contains"),
+        );
         yield* command(worktree, ["switch", "--orphan", "other"]);
-        expect((yield* service.runNow).entries[0]).toMatchObject(changed);
-        yield* command(worktree, ["switch", "-c", "(feature)", "feature"]);
-        setThreads([shell({ branch: "(feature)", worktreePath: worktree })]);
-        expect((yield* service.runNow).entries[0]).toMatchObject(changed);
-        setThreads([shell({ branch: "feature", worktreePath: worktree })]);
+        expect((yield* service.runNow).entries[0]).toMatchObject(keptFor("Branch has no commits"));
         yield* command(worktree, ["tag", "feature", "feature"]);
         // Newer Git refuses to create a tag named HEAD, but still reads one.
         yield* command(worktree, ["update-ref", "refs/tags/HEAD", "refs/heads/feature"]);
@@ -2443,9 +2455,17 @@ describe("storage cleanup reports and local file policies", () => {
         yield* fs.remove(`${index.trim()}.lock`);
         const gitFile = yield* fs.readFileString(`${worktree}/.git`);
         yield* fs.writeFileString(`${worktree}/.git`, "gitdir: /missing-git-directory\n");
-        expect((yield* service.runNow).entries[0]).toMatchObject(changed);
+        expect((yield* service.runNow).entries[0]).toMatchObject(keptFor("Not a git repository"));
         yield* fs.writeFileString(`${worktree}/.git`, gitFile);
+        yield* command(worktree, ["branch", "-m", "feature", "feat/renamed"]);
+        expect((yield* service.runNow).entries[0]).toMatchObject(
+          keptFor("Branch changed to feat/renamed; the next cleanup rechecks it"),
+        );
+        expect(threads()[0]?.branch).toBe("feat/renamed");
+        yield* command(worktree, ["checkout", "--detach"]);
         expect((yield* service.runNow).entries[0]).toMatchObject({ outcome: "removed" });
+        expect(yield* fs.exists(worktree)).toBe(false);
+        yield* command(repo, ["show-ref", "--verify", "refs/heads/feat/renamed"]);
         expect(fullStatusCalls()).toBe(0);
       }),
     ),
